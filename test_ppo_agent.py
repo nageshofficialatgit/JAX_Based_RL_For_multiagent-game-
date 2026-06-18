@@ -439,6 +439,10 @@ class BCAgent:
         
         self.prev_fleets = {}
         self.prev_planets = {}
+        
+        self.active_fleets = {}
+        self.pending_launches = []
+        self.missed_log = os.path.join(base_dir, "missed_fleets.log")
 
     def __call__(self, obs, config=None):
         try:
@@ -463,7 +467,82 @@ class BCAgent:
                 
             self.rng, rng_sample = jax.random.split(self.rng)
             
-            tick = obs_dict.get('step', 0)
+            tick = int(obs_dict.get('step', 0))
+            if tick == 0:
+                self.initial_x = None
+                self.initial_y = None
+                self.active_fleets = {}
+                self.pending_launches = []
+                with open(self.missed_log, "w") as f:
+                    f.write("=== FLEET MISS TRACKER LOG ===\n")
+                    
+            # --- FLEET TRACKING LOGIC ---
+            current_fleet_ids = set()
+            for f in obs_dict.get('fleets', []):
+                fid = int(f[0])
+                owner = int(f[1])
+                x, y = float(f[2]), float(f[3])
+                angle = float(f[4])
+                source = int(f[5])
+                ships = float(f[6])
+                
+                if owner == self.player_id:
+                    current_fleet_ids.add(fid)
+                    
+                    matched = None
+                    for pending in self.pending_launches:
+                        # Match by source, rough angle, and rough ship count
+                        if pending['source'] == source and abs(pending['angle'] - angle) < 0.05 and abs(pending['ships'] - ships) < 2.0:
+                            matched = pending
+                            break
+                    if matched:
+                        self.pending_launches.remove(matched)
+                        self.active_fleets[fid] = matched
+                        self.active_fleets[fid]['last_x'] = x
+                        self.active_fleets[fid]['last_y'] = y
+                    elif fid in self.active_fleets:
+                        self.active_fleets[fid]['last_x'] = x
+                        self.active_fleets[fid]['last_y'] = y
+
+            vanished_fids = []
+            for fid, fdata in self.active_fleets.items():
+                if fid not in current_fleet_ids:
+                    vanished_fids.append(fid)
+            
+            for fid in vanished_fids:
+                fdata = self.active_fleets.pop(fid)
+                target_idx = fdata['target']
+                
+                # Check target planet's current position
+                target_p = None
+                for p in obs_dict.get('planets', []):
+                    if int(p[0]) == target_idx:
+                        target_p = p
+                        break
+                
+                if target_p:
+                    tgt_x, tgt_y = float(target_p[2]), float(target_p[3])
+                    tgt_r = float(target_p[4])
+                    
+                    last_x, last_y = fdata['last_x'], fdata['last_y']
+                    dist = math.hypot(tgt_x - last_x, tgt_y - last_y)
+                    
+                    out_of_bounds = last_x < 1 or last_x > 99 or last_y < 1 or last_y > 99
+                    
+                    # If it died out of bounds or far from the target planet, it's a MISS
+                    if out_of_bounds or dist > tgt_r + 2.0:
+                        with open(self.missed_log, "a") as f:
+                            f.write(f"\n[TICK {tick}] MISSED FLEET DETECTED!\n")
+                            f.write(f"  Source Planet: {fdata['source']}, Target Planet: {fdata['target']}\n")
+                            f.write(f"  Fleet Details: Ships: {fdata['ships']:.1f}, Speed: {fdata['speed']:.2f}, Launch Angle: {fdata['angle']:.3f} rad\n")
+                            f.write(f"  Death Position : (x:{last_x:.2f}, y:{last_y:.2f}). Distance to target: {dist:.2f} (Target Radius: {tgt_r:.2f})\n")
+                            f.write(f"  Out of bounds  : {out_of_bounds}\n")
+                            
+                            r = math.hypot(tgt_x - 50.0, tgt_y - 50.0)
+                            theta = math.atan2(tgt_y - 50.0, tgt_x - 50.0)
+                            f.write(f"  Target Position: Cartesian (x:{tgt_x:.2f}, y:{tgt_y:.2f}) -> Polar (r:{r:.2f}, theta:{theta:.3f} rad)\n")
+                            f.write(f"  Target Orbiting: {fdata['target_orbiting']}\n")
+                            f.write(f"  Launch Logit   : l_logit={fdata['l_logits']:.3f}\n")
             
             # Use Kaggle's initial_planets (exact tick-0 positions) for orbital math
             init_planets = obs_dict.get('initial_planets', [])
@@ -558,8 +637,6 @@ class BCAgent:
                             tgt_orbiting = bool(env_state.planet_is_orbiting[tgt_idx])
                             angular_velocity = float(obs_dict.get('angular_velocity', 0.02))
                             
-                            angle = refine_angle(fx, fy, float(env_state.planet_radius[src_idx]), tgt_x, tgt_y, tgt_r, tgt_orbiting, speed, angle, angular_velocity)
-                            
                             # Angle is perfectly computed by upgraded apply_actions solver
                             actions.append([src_idx, angle, ships])
                             
@@ -628,9 +705,19 @@ class BCAgent:
                         tgt_orbiting = bool(env_state.planet_is_orbiting[tgt_idx])
                         angular_velocity = float(obs_dict.get('angular_velocity', 0.02))
                         
-                        angle = refine_angle(fx, fy, float(env_state.planet_radius[src_idx]), tgt_x, tgt_y, tgt_r, tgt_orbiting, speed, angle, angular_velocity)
-                        
                         actions.append([src_idx, angle, ships])
+                        
+                        # Store in pending launches for tracking
+                        self.pending_launches.append({
+                            'source': src_idx,
+                            'target': tgt_idx,
+                            'angle': angle,
+                            'ships': ships,
+                            'speed': speed,
+                            'l_logits': float(l_logits[0][src_idx]),
+                            'target_orbiting': tgt_orbiting,
+                            'tick_launched': tick
+                        })
                         
                 with open(self.log_file, "a") as f:
                     f.write(f"\n[TICK {tick}] Player {player_id} RAW MODEL EXECUTION (Greedy)\n")
