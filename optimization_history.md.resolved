@@ -1,0 +1,39 @@
+# Comprehensive Speed Optimization History
+
+This document outlines the complete timeline of changes made to dramatically accelerate the Orbit Wars CMA-ES tuning pipeline and the `braniac_v2.py` agent, reducing the estimated 200-generation completion time from over 50 hours to ~10 hours.
+
+### Phase 1: Fixing Concurrency and Process Overheads
+**1. Numba Cache Collision Removal**
+*   **The Problem:** The `cma_tuner.py` script was crashing during parallel execution because Numba was attempting to write compiled cache files (`cache=True` in `@njit`) for dynamically loaded modules, causing severe namespace collisions.
+*   **The Fix:** Removed `cache=True` from `fast_score_action_via_delta` in `braniac_v2.py`. This enabled stable parallel execution across 32 multiprocessing workers without filesystem deadlocks.
+
+**2. Persistent Multiprocessing Pool**
+*   **The Problem:** `cma_tuner.py` and `arena.py` were tearing down and re-spawning a 32-process `multiprocessing.Pool` inside the simulation loops. Spawning processes is expensive, and doing this frequently caused immense process churn and CPU overhead.
+*   **The Fix:** Refactored the architecture so the `Pool` is initialized exactly once at the top of the CMA-ES generation loop. The persistent pool reference is now passed directly into `run_arena()`, keeping workers alive across generations.
+
+### Phase 2: Eliminating Inner-Loop Simulation Bottlenecks
+**3. Numba Array Allocation Thrashing**
+*   **The Problem:** During candidate simulation (Beam Search), `fast_score_action_via_delta` was creating a new numpy array (`np.zeros((101, 50, 6))`, ~242KB) on every single call. Called up to 140,000 times per game, this resulted in allocating and garbage-collecting over 50GB of memory per worker per game.
+*   **The Fix:** Hoisted the array allocation out of the JIT loop. We created a Python function `prepare_world_state` that allocates the `arrivals_table` exactly once per turn. The pre-allocated array is passed into the JIT function, mutated, and safely zeroed out after computation.
+
+**4. O(N×T) Orbital Iteration Overhead in Spread Calculation**
+*   **The Problem:** Inside `fast_score_action_via_delta`, evaluating the spatial spread (at `t=30` and `t=60`) required iterating over all 50 planets and all 100 future timesteps to detect fleet arrivals—leading to ~33,000 loops per evaluation call.
+*   **The Fix:** Rewrote the Numba logic to strictly iterate over the sparse `arrival_eta` and `arrival_pid` arrays. This dropped iterations to <1,000 per call, achieving a ~20x speedup for that calculation block.
+
+**5. Beam Search Depth Trimming**
+*   **The Problem:** The generative search (`generate_candidate_missions`) used a `max_depth` of 3. Combined with a `beam_width` of 3, the agent was scoring 70 nested node permutations per step.
+*   **The Fix:** Lowered `max_depth` to 2, trimming the evaluation tree size to 30 nodes per step. Because the scoring function is now blistering fast, total candidate evaluation time per step fell from ~20ms to under 2ms.
+
+### Phase 3: Profiling & Algorithmic Refinement
+**6. The 2-Million Call `_is_orbital` Python Trap**
+*   **The Problem:** After resolving Numba issues, cProfile data revealed that `World.__init__` was taking ~48% of the agent's total runtime. This was traced to `fleet_target_planet`, which was calling `_is_orbital()` mathematically to compute planet radii and distances—over **2,008,448 times per game** during ray-casting loops.
+*   **The Fix:** Refactored `fleet_target_planet` to pre-filter the `planets` list into `static_planets` and `orbital_planets` *outside* the heavy per-turn simulation loop. This eliminated the redundant math checks entirely, dropping the `World` object instantiation time from 5.8 seconds down to a few milliseconds.
+
+### Phase 4: Parallel Pipeline Utilization
+**7. Multiprocessing Pipeline Starvation**
+*   **The Problem:** The `cma_tuner.py` loop was calling `pool.imap_unordered` sequentially, *one candidate at a time*. Since workers finish games at slightly different speeds, 40% of the CPU threads were sitting idle at the end of each candidate's batch, waiting for the stragglers to finish.
+*   **The Fix:** Flattened the execution queue (`all_args`). Now, all 640 games for a generation are constructed up front and submitted to `pool.imap_unordered` concurrently. The cluster now sustains 100% CPU utilization.
+
+**8. Hyperparameter: Games Per Evaluation**
+*   **The Problem:** Evaluating 50 games per candidate was computationally excessive for a 32-population CMA-ES gradient descent.
+*   **The Fix:** Safely reduced `n_games_per_eval` from 50 to 20, bringing the generation cycle time down proportionately to ~3-4 minutes per generation.

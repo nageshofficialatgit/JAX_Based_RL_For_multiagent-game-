@@ -96,32 +96,30 @@ class OrbitWarsDataSource(grain.RandomAccessDataSource):
                 print("Filtering dataset to Grandmaster episodes only...")
                 gm_df = pd.read_csv(gm_file)
                 self.gm_ids = set(gm_df['episode_id'].values)
-                mask = df_planet_state['episode_id'].isin(self.gm_ids)
-                df_planet_state = df_planet_state[mask]
-                print(f"Grandmaster Filter reduced planet_state from millions to {len(df_planet_state)} rows.")
-            else:
-                print("WARNING: grandmaster_episodes.csv not found. Did you run filter_grandmasters.py?")
+        print("Collecting Polars Dataframe (Zero Pandas Overhead)...")
+        df_planet_state_pl = pl.scan_parquet(os.path.join(self.db_path, "planet_state.parquet"))
         
-        # Temporal Sub-sampling (only keep every Nth tick)
-        self.target_episodes = df_planet_state['episode_id'].unique()
-        print("Building index with Temporal Sub-sampling...")
-        all_states = df_planet_state[['episode_id', 'tick']].drop_duplicates()
-        
-        # Temporal Sub-sampling (only keep every Nth tick)
-        if self.subsample_ticks > 1:
-            all_states = all_states[all_states['tick'] % self.subsample_ticks == 0]
+        if self.gm_ids is not None:
+            df_planet_state_pl = df_planet_state_pl.filter(pl.col('episode_id').is_in(self.gm_ids))
             
+        if self.subsample_ticks > 1:
+            df_planet_state_pl = df_planet_state_pl.filter(pl.col('tick') % self.subsample_ticks == 0)
+            
+        df_pl_mem = df_planet_state_pl.collect()
+        
         # --- THE ZERO-COPY MULTIPROCESSING FIX ---
         print("Building Memory-Efficient NumPy Index for planet_state...")
-        
         mmap_cache_path = os.path.join(self.db_path, "planet_state_mmap_cache.npy")
         
         # Only write the 6GB chunk to disk once
         if not os.path.exists(mmap_cache_path):
             print("Writing planet_state to disk for Zero-Copy IPC sharing...")
-            temp_arr = df_planet_state[['planet_id', 'owner', 'ships']].values.astype(np.float32)
+            p_id = df_pl_mem["planet_id"].to_numpy().astype(np.float32)
+            owner = df_pl_mem["owner"].to_numpy().astype(np.float32)
+            ships = df_pl_mem["ships"].to_numpy().astype(np.float32)
+            temp_arr = np.stack([p_id, owner, ships], axis=1)
             np.save(mmap_cache_path, temp_arr)
-            del temp_arr
+            del temp_arr, p_id, owner, ships
             gc.collect()
 
         # Connect to the memory-mapped file. 
@@ -130,20 +128,28 @@ class OrbitWarsDataSource(grain.RandomAccessDataSource):
         self.planet_state_arr = np.load(mmap_cache_path, mmap_mode='r')
         
         # Build dict mapping (episode_id, tick) -> (start_idx, end_idx)
-        ep_ticks = df_planet_state[['episode_id', 'tick']].values
+        print("Extracting Episode/Tick keys...")
+        ep = df_pl_mem["episode_id"].to_numpy()
+        ticks = df_pl_mem["tick"].to_numpy()
         
         self.state_lookup = {}
         curr_key = None
         start_idx = 0
-        for i in range(len(ep_ticks)):
-            key = (ep_ticks[i, 0], ep_ticks[i, 1])
+        for i in range(len(ep)):
+            key = (ep[i], ticks[i])
             if key != curr_key:
                 if curr_key is not None:
                     self.state_lookup[curr_key] = (start_idx, i)
                 curr_key = key
                 start_idx = i
         if curr_key is not None:
-            self.state_lookup[curr_key] = (start_idx, len(ep_ticks))
+            self.state_lookup[curr_key] = (start_idx, len(ep))
+            
+        # CRITICAL FIX: Delete the massive 20GB Polars frame and arrays from RAM before doing anything else
+        del df_pl_mem
+        del ep
+        del ticks
+        gc.collect()
             
         print("Memory-Efficient NumPy Index built.")
         
@@ -152,9 +158,8 @@ class OrbitWarsDataSource(grain.RandomAccessDataSource):
         if self.subsample_ticks > 1:
             self.state_index = [k for k in self.state_index if k[1] % self.subsample_ticks == 0]
         
-        # Crucial Memory Fix: Delete the dataframes from the main process!
-        del df_planet_state
-        gc.collect()
+        # Filter out unused episodes for later stages using the state_lookup keys
+        self.target_episodes = np.unique([k[0] for k in self.state_index])
         
         # Load episode_planets with Polars (Rust multi-threaded I/O)
         print("Loading episode_planets with Polars (Rust Engine)...")
@@ -208,29 +213,27 @@ class OrbitWarsDataSource(grain.RandomAccessDataSource):
         print("All memory-efficient indexes built.")
         
         # --- THE MULTIPROCESSING IPC BYPASS ---
-        # Pickling massive dictionaries to 8 workers causes a single-threaded IPC deadlock.
-        # We save them to disk here, and delete them from the object.
-        cache_dict_path = os.path.join(self.db_path, "metadata_dicts_cache.pkl")
-        if not os.path.exists(cache_dict_path):
-            print("Writing metadata dictionaries to disk for fast worker loading...")
-            import pickle
-            with open(cache_dict_path, 'wb') as f:
-                pickle.dump({
-                    'state_lookup': self.state_lookup,
-                    'episode_planets_dict_np': self.episode_planets_dict_np,
-                    'actions_dict_np': self.actions_dict_np,
-                    'episode_to_winner': self.episode_to_winner,
-                    'episode_to_win_rate': self.episode_to_win_rate,
-                    'episode_to_angular_vel': self.episode_to_angular_vel,
-                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # cache_dict_path = os.path.join(self.db_path, "metadata_dicts_cache.pkl")
+        # if not os.path.exists(cache_dict_path):
+        #     print("Writing metadata dictionaries to disk for fast worker loading...")
+        #     import pickle
+        #     with open(cache_dict_path, 'wb') as f:
+        #         pickle.dump({
+        #             'state_lookup': self.state_lookup,
+        #             'episode_planets_dict_np': self.episode_planets_dict_np,
+        #             'actions_dict_np': self.actions_dict_np,
+        #             'episode_to_winner': self.episode_to_winner,
+        #             'episode_to_win_rate': self.episode_to_win_rate,
+        #             'episode_to_angular_vel': self.episode_to_angular_vel,
+        #         }, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-        # Delete from the parent object to ensure the Dataloader pickle is completely empty (microsecond serialization)
-        self.state_lookup = None
-        self.episode_planets_dict_np = None
-        self.actions_dict_np = None
-        self.episode_to_winner = None
-        self.episode_to_win_rate = None
-        self.episode_to_angular_vel = None
+        # We are using workers=0, so keep them in memory to avoid the 46GB unpickling memory spike.
+        # self.state_lookup = None
+        # self.episode_planets_dict_np = None
+        # self.actions_dict_np = None
+        # self.episode_to_winner = None
+        # self.episode_to_win_rate = None
+        # self.episode_to_angular_vel = None
         self.planet_state_arr = None  # CRITICAL: pickle reads memmap bytes into RAM. We must bypass this.
         
         print(f"Grain DataSource ready. Total states to train on: {len(self.state_index)}")
@@ -241,19 +244,20 @@ class OrbitWarsDataSource(grain.RandomAccessDataSource):
         return len(self.state_index)
 
     def __getitem__(self, idx):
-        # WORKER LAZY LOAD: The first time a worker tries to get an item, load the dictionaries directly from disk
-        if self.state_lookup is None:
-            import pickle
-            cache_dict_path = os.path.join(self.db_path, "metadata_dicts_cache.pkl")
-            with open(cache_dict_path, 'rb') as f:
-                d = pickle.load(f)
-                self.state_lookup = d['state_lookup']
-                self.episode_planets_dict_np = d['episode_planets_dict_np']
-                self.actions_dict_np = d['actions_dict_np']
-                self.episode_to_winner = d['episode_to_winner']
-                self.episode_to_win_rate = d['episode_to_win_rate']
-                self.episode_to_angular_vel = d['episode_to_angular_vel']
+        # WORKER LAZY LOAD (Disabled for workers=0 to avoid pickle RAM explosion)
+        # if self.state_lookup is None:
+        #     import pickle
+        #     cache_dict_path = os.path.join(self.db_path, "metadata_dicts_cache.pkl")
+        #     with open(cache_dict_path, 'rb') as f:
+        #         d = pickle.load(f)
+        #         self.state_lookup = d['state_lookup']
+        #         self.episode_planets_dict_np = d['episode_planets_dict_np']
+        #         self.actions_dict_np = d['actions_dict_np']
+        #         self.episode_to_winner = d['episode_to_winner']
+        #         self.episode_to_win_rate = d['episode_to_win_rate']
+        #         self.episode_to_angular_vel = d['episode_to_angular_vel']
                 
+        if self.planet_state_arr is None:
             mmap_cache_path = os.path.join(self.db_path, "planet_state_mmap_cache.npy")
             self.planet_state_arr = np.load(mmap_cache_path, mmap_mode='r')
 

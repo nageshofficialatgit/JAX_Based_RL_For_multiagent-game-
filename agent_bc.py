@@ -17,7 +17,7 @@ except ImportError:
 
 import typing
 
-USE_MCTX = True
+USE_MCTX = False
 MCTX_SIMULATIONS = 32
 MCTX_CANDIDATES = 8
 
@@ -349,7 +349,7 @@ class BCAgent:
         if not os.path.exists(os.path.join(base_dir, "checkpoints")):
             base_dir = os.getcwd()
             
-        ckpt_path = os.path.join(base_dir, "checkpoints", "benchmarks", "bc_v2.bin")
+        ckpt_path = os.path.join(base_dir, "checkpoints", "ppo_v2_3050.bin")
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Missing Checkpoint: {ckpt_path}")
             
@@ -364,12 +364,13 @@ class BCAgent:
         
         # Initialize log file
         self.log_file = os.path.join(base_dir, "agent_brain.log")
-        with open(self.log_file, "w") as f:
-            f.write("=== ORBIT WARS AGENT BRAIN LOG ===\n")
-            f.write("Recording Internal Logits & Confidence\n\n")
+        # Don't overwrite the log file here, local_kaggle_eval clears it
             
         self.initial_x = None
         self.initial_y = None
+        
+        self.prev_fleets = {}
+        self.prev_planets = {}
 
     def __call__(self, obs):
         try:
@@ -389,6 +390,37 @@ class BCAgent:
                     pid = int(p[0])
                     self.initial_x[pid] = float(p[2])
                     self.initial_y[pid] = float(p[3])
+                    
+            # Event Tracking
+            curr_fleets = {f[0]: f for f in obs_dict.get('fleets', [])}
+            curr_planets = {p[0]: p for p in obs_dict.get('planets', [])}
+            
+            if tick > 0:
+                events = []
+                for fid, f in curr_fleets.items():
+                    if fid not in self.prev_fleets:
+                        events.append(f"[EVENT: LAUNCH] P{f[1]} launched {f[6]} ships from Planet {f[5]} (Fleet {fid})")
+                        
+                for fid, prev_f in self.prev_fleets.items():
+                    if fid not in curr_fleets:
+                        events.append(f"[EVENT: FLEET_END] Fleet {fid} ({prev_f[6]} ships of P{prev_f[1]}) disappeared.")
+                
+                for pid, curr_p in curr_planets.items():
+                    prev_p = self.prev_planets.get(pid)
+                    if prev_p:
+                        if curr_p[1] != prev_p[1]:
+                            events.append(f"[EVENT: CAPTURE] Planet {pid} captured by P{curr_p[1]} (from P{prev_p[1]}) with {curr_p[5]} ships!")
+                        elif curr_p[5] < prev_p[5] - 2.0: # Filter natural decay/growth
+                            events.append(f"[EVENT: COMBAT] Planet {pid} attacked! Ships dropped from {prev_p[5]} to {curr_p[5]}.")
+                
+                if events:
+                    with open(self.log_file, "a") as logf:
+                        logf.write(f"\n--- TICK {tick} EVENTS ---\n")
+                        for e in events:
+                            logf.write(f"{e}\n")
+                            
+            self.prev_fleets = curr_fleets
+            self.prev_planets = curr_planets
             
             # 1. Feature Extraction entirely in JAX using exact mathematical formulas
             env_state = parse_kaggle_obs(obs_dict, raw_player=raw_player, initial_x=self.initial_x, initial_y=self.initial_y)
@@ -422,14 +454,7 @@ class BCAgent:
                             available = float(env_state.planet_ships[src_idx])
                             ships_to_send = max(1, int(available * ship_pct))
                             
-                            actions.append([
-                                int(src_idx),
-                                float(math.atan2(
-                                    float(env_state.planet_y[tgt_idx]) - float(env_state.planet_y[src_idx]), 
-                                    float(env_state.planet_x[tgt_idx]) - float(env_state.planet_x[src_idx])
-                                )),
-                                int(ships_to_send)
-                            ])
+                            actions.append(f"SHIP {src_idx} {ships_to_send} {tgt_idx}")
                             
                     with open(self.log_file, "a") as f:
                         f.write(f"\n[TICK {tick}] Player {player_id} MCTX Search Complete in {t1-t0:.3f}s\n")
@@ -443,8 +468,49 @@ class BCAgent:
                         f.write(f"MCTX CRASH: {e}\\n")
                     # Fallback to empty if MCTX fails
                     return []
-                    
-            return []
+            else:
+                # RAW MODEL EXECUTION (No Search)
+                _, l_logits, a_logits, s_logits, _ = self.merged_model(obs_tensor, return_policy=True, valid_launch_mask=valid_launch_mask[None])
+                
+                TEMPERATURE = 2.0
+                LAUNCH_PENALTY = 0.0 # Higher penalty makes launch less likely
+                
+                self.rng, k1, k2, k3 = jax.random.split(self.rng, 4)
+                
+                # Temperature scaled sampling
+                l_prob = jax.nn.sigmoid((l_logits[0] - LAUNCH_PENALTY) / TEMPERATURE)
+                l_acts = (jax.random.uniform(k1, l_logits[0].shape) < l_prob) & valid_launch_mask
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"  l_logits max: {np.max(l_logits[0]):.3f}, min: {np.min(l_logits[0]):.3f}\n")
+                    f.write(f"  l_prob max: {np.max(l_prob):.3f}\n")
+                    f.write(f"  Valid planets: {np.sum(valid_launch_mask)}\n")
+                
+                t_acts = jax.random.categorical(k2, a_logits[0] / TEMPERATURE, axis=-1)
+                s_acts = jax.random.categorical(k3, s_logits[0] / TEMPERATURE, axis=-1)
+                
+                l_acts = np.array(l_acts)
+                t_acts = np.array(t_acts)
+                s_acts = np.array(s_acts)
+                
+                actions = []
+                for src_idx in range(50):
+                    if l_acts[src_idx] and my_planets_mask[src_idx]:
+                        tgt_idx = int(t_acts[src_idx])
+                        s_idx = int(s_acts[src_idx])
+                        
+                        ship_pct = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0][min(s_idx, 9)]
+                        available = float(env_state.planet_ships[src_idx])
+                        ships_to_send = max(1, int(available * ship_pct))
+                        
+                        actions.append(f"SHIP {src_idx} {ships_to_send} {tgt_idx}")
+                        
+                with open(self.log_file, "a") as f:
+                    f.write(f"\n[TICK {tick}] Player {player_id} RAW MODEL EXECUTION (Temp={TEMPERATURE}, Penalty={LAUNCH_PENALTY})\n")
+                    f.write(f"  Actions generated: {actions}\n")
+                        
+                return actions
+
             
         except Exception as e:
             with open(self.log_file, "a") as f:

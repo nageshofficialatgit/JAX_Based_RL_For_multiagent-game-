@@ -246,7 +246,9 @@ def apply_actions(state: EnvState, player_id: int, launch: jnp.ndarray, target: 
         speed = get_fleet_speed(send_ships)
         
         # --- PERFECT INTERCEPTION MATHEMATICS (STATIC VECTORIZATION) ---
-        t_arr = jnp.arange(1, 151, dtype=jnp.float32)
+        # Expanded from 150 to 500 to guarantee interception calculations for very slow fleets
+        # traveling across the entire board, preventing them from 'missing' and flying out of bounds.
+        t_arr = jnp.arange(1, 501, dtype=jnp.float32)
         
         # Calculate Target's orbital parameters
         dx_orb = st.planet_initial_x[target_idx] - 50.0
@@ -270,8 +272,40 @@ def apply_actions(state: EnvState, player_id: int, launch: jnp.ndarray, target: 
         
         # Find the first valid t index (fallback to index 0 if none)
         best_idx = jnp.argmax(valid_mask)
-        best_px = px_arr[best_idx]
-        best_py = py_arr[best_idx]
+        t_approx = t_arr[best_idx]
+        
+        # --- CONTINUOUS INTERCEPT REFINEMENT (BINARY SEARCH) ---
+        low_t = jnp.maximum(0.0, t_approx - 1.0)
+        high_t = t_approx
+        
+        def refine_step(i, carry):
+            low, high = carry
+            mid = (low + high) / 2.0
+            
+            a_mid = init_angle + st.angular_velocity * (st.tick + mid)
+            px_orb_mid = 50.0 + orb_r * jnp.cos(a_mid)
+            py_orb_mid = 50.0 + orb_r * jnp.sin(a_mid)
+            
+            px_lin_mid = st.planet_x[target_idx] + st.planet_dx[target_idx] * mid
+            py_lin_mid = st.planet_y[target_idx] + st.planet_dy[target_idx] * mid
+            
+            px_mid = jnp.where(tgt_is_orb, px_orb_mid, px_lin_mid)
+            py_mid = jnp.where(tgt_is_orb, py_orb_mid, py_lin_mid)
+            
+            dist = jnp.hypot(px_mid - st.planet_x[p_idx], py_mid - st.planet_y[p_idx])
+            # Kaggle engine physics: fleets spawn at edge + 0.1, and hit at target edge
+            fleet_dist = speed * mid + st.planet_radius[p_idx] + 0.1 + st.planet_radius[target_idx]
+            
+            new_low = jnp.where(fleet_dist < dist, mid, low)
+            new_high = jnp.where(fleet_dist < dist, high, mid)
+            return (new_low, new_high)
+            
+        final_low, final_high = jax.lax.fori_loop(0, 15, refine_step, (low_t, high_t))
+        best_t = final_high
+        
+        final_a = init_angle + st.angular_velocity * (st.tick + best_t)
+        best_px = jnp.where(tgt_is_orb, 50.0 + orb_r * jnp.cos(final_a), st.planet_x[target_idx] + st.planet_dx[target_idx] * best_t)
+        best_py = jnp.where(tgt_is_orb, 50.0 + orb_r * jnp.sin(final_a), st.planet_y[target_idx] + st.planet_dy[target_idx] * best_t)
         
         angle_rad = jnp.arctan2(best_py - st.planet_y[p_idx], best_px - st.planet_x[p_idx])
         
@@ -282,11 +316,15 @@ def apply_actions(state: EnvState, player_id: int, launch: jnp.ndarray, target: 
         dx = jnp.cos(angle_rad) * speed
         dy = jnp.sin(angle_rad) * speed
         
+        # Spawn exactly like Kaggle: at edge + 0.1
+        start_x = st.planet_x[p_idx] + jnp.cos(angle_rad) * (st.planet_radius[p_idx] + 0.1)
+        start_y = st.planet_y[p_idx] + jnp.sin(angle_rad) * (st.planet_radius[p_idx] + 0.1)
+        
         new_active = jnp.where(is_valid, st.fleet_active.at[empty_slot].set(1), st.fleet_active)
         new_f_owner = jnp.where(is_valid, st.fleet_owner.at[empty_slot].set(player_id), st.fleet_owner)
         new_f_ships = jnp.where(is_valid, st.fleet_ships.at[empty_slot].set(send_ships), st.fleet_ships)
-        new_f_x = jnp.where(is_valid, st.fleet_x.at[empty_slot].set(st.planet_x[p_idx]), st.fleet_x)
-        new_f_y = jnp.where(is_valid, st.fleet_y.at[empty_slot].set(st.planet_y[p_idx]), st.fleet_y)
+        new_f_x = jnp.where(is_valid, st.fleet_x.at[empty_slot].set(start_x), st.fleet_x)
+        new_f_y = jnp.where(is_valid, st.fleet_y.at[empty_slot].set(start_y), st.fleet_y)
         new_f_dx = jnp.where(is_valid, st.fleet_dx.at[empty_slot].set(dx), st.fleet_dx)
         new_f_dy = jnp.where(is_valid, st.fleet_dy.at[empty_slot].set(dy), st.fleet_dy)
         new_f_src = jnp.where(is_valid, st.fleet_src_planet.at[empty_slot].set(p_idx), st.fleet_src_planet)
@@ -504,9 +542,11 @@ def build_observation(state: EnvState, player_id: int, win_rate: float = 0.5) ->
 
     p_tensor = p_tensor.at[:n_planets, 10].set(state.tick / 1000.0)
     
-    # If distance to center is small, the sun blocks straight lines to the opposite side
-    sun_shadow = jnp.where(jnp.hypot(state.planet_x - 50.0, state.planet_y - 50.0) < 15.0, 1.0, 0.0)
-    p_tensor = p_tensor.at[:n_planets, 28].set(sun_shadow)
+    # Feature 11: True Local Angular Velocity (matches dataset_grain_v2)
+    is_orbiting_mask = state.planet_is_orbiting
+    is_comet_mask = (jnp.arange(50) >= 46).astype(jnp.float32)
+    true_ang_vel = state.angular_velocity * is_orbiting_mask * (1.0 - is_comet_mask)
+    p_tensor = p_tensor.at[:n_planets, 11].set(true_ang_vel)
     
     # Feature 12, 13 for comet velocity (dx, dy)
     p_tensor = p_tensor.at[:n_planets, 12].set(state.planet_dx / 6.0)
@@ -608,9 +648,10 @@ def build_observation(state: EnvState, player_id: int, win_rate: float = 0.5) ->
     fleet_impact_matrix = jnp.where(is_same_owner, f_ships[:, None], -f_ships[:, None]) * target_mask # [F, 50]
     time_mask = eta_matrix_all[:, None, :] <= eta_matrix_all[None, :, :] # [F_j, F_i, 50]
     past_impacts = jnp.sum(fleet_impact_matrix[:, None, :] * time_mask, axis=0) # [F_i, 50]
-    G_matrix = state.planet_ships[None, :] + state.planet_production[None, :] * eta_matrix_all + past_impacts
+    safe_eta = jnp.where(eta_matrix_all == jnp.inf, 0.0, eta_matrix_all)
+    G_matrix = state.planet_ships[None, :] + state.planet_production[None, :] * safe_eta + past_impacts
     is_valid_eval = (target_mask > 0.5) & ~is_same_owner
-    valid_G = jnp.where(is_valid_eval, G_matrix, jnp.inf)
+    valid_G = jnp.where(is_valid_eval & (eta_matrix_all != jnp.inf), G_matrix, jnp.inf)
     min_G = jnp.min(valid_G, axis=0) # [50]
     
     true_capture_cost = jnp.where(min_G == jnp.inf, state.planet_ships, min_G)
@@ -626,20 +667,40 @@ def build_observation(state: EnvState, player_id: int, win_rate: float = 0.5) ->
     min_enemy_dist = jnp.min(enemy_dist, axis=1) # [50]
     p_tensor = p_tensor.at[:n_planets, 25].set(1.0 / (1.0 + min_enemy_dist / 10.0))
     
-    # Feature 26: Tangential Velocity Phase
-    cur_angle_planet = jnp.arctan2(state.planet_initial_y - 50.0, state.planet_initial_x - 50.0) + state.angular_velocity * state.tick
-    phase_x = jnp.where(state.planet_is_orbiting > 0.5, -jnp.sin(cur_angle_planet), 0.0)
-    p_tensor = p_tensor.at[:n_planets, 26].set(phase_x)
+    # Feature 26: Sun Shadow Angular Width (matches dataset_grain_v2)
+    dist_to_sun = jnp.hypot(state.planet_x - 50.0, state.planet_y - 50.0)
+    safe_dist = jnp.maximum(dist_to_sun, 10.1)  # Prevent arcsin > 1
+    angular_width = 2.0 * jnp.arcsin(10.0 / safe_dist)
+    p_tensor = p_tensor.at[:n_planets, 26].set(angular_width / jnp.pi)
 
-    # Feature 27, 28, 29: Threat Density Map (Local, Mid, Global)
+    # Feature 27: Threat Density (local, matches dataset_grain_v2 15-tick horizon approximation)
     enemy_ships_total = state.planet_ships * enemy_planet_mask
     density_local = jnp.sum(enemy_ships_total[None, :] * (dist_mat <= 20.0), axis=1)
-    density_mid = jnp.sum(enemy_ships_total[None, :] * (dist_mat <= 50.0), axis=1)
-    density_global = jnp.sum(enemy_ships_total)
-    
     p_tensor = p_tensor.at[:n_planets, 27].set(jnp.clip(density_local / 200.0, 0.0, 1.0))
-    p_tensor = p_tensor.at[:n_planets, 28].set(jnp.clip(density_mid / 500.0, 0.0, 1.0))
-    p_tensor = p_tensor.at[:n_planets, 29].set(jnp.clip(density_global / 1000.0, 0.0, 1.0))
+    
+    # Feature 28: Economic Momentum (matches dataset_grain_v2)
+    my_prod_f28 = jnp.sum(state.planet_production * (ego_planet_owner == 1.0))
+    enemy_prod_f28 = jnp.sum(state.planet_production * (ego_planet_owner >= 2.0))
+    net_production_advantage = my_prod_f28 - enemy_prod_f28
+    p_tensor = p_tensor.at[:n_planets, 28].set(jnp.clip(net_production_advantage / 25.0, -1.0, 1.0))
+    
+    # Feature 29: Angular Convergence (matches dataset_grain_v2)
+    is_orbiting_f29 = state.planet_is_orbiting
+    dx_orb_f29 = state.planet_x - 50.0
+    dy_orb_f29 = state.planet_y - 50.0
+    orb_vx = -dy_orb_f29 * state.angular_velocity
+    orb_vy = dx_orb_f29 * state.angular_velocity
+    # Vector from each planet to player's center of mass
+    my_mask_f29 = (state.planet_owner == player_id) & is_active
+    my_count_f29 = jnp.sum(my_mask_f29)
+    my_cx_f29 = jnp.sum((state.planet_x - 50.0) * my_mask_f29) / (my_count_f29 + 1e-8) + 50.0
+    my_cy_f29 = jnp.sum((state.planet_y - 50.0) * my_mask_f29) / (my_count_f29 + 1e-8) + 50.0
+    to_me_x = my_cx_f29 - state.planet_x
+    to_me_y = my_cy_f29 - state.planet_y
+    mag_v = jnp.hypot(orb_vx, orb_vy) + 1e-8
+    mag_me = jnp.hypot(to_me_x, to_me_y) + 1e-8
+    convergence = (orb_vx * to_me_x + orb_vy * to_me_y) / (mag_v * mag_me)
+    p_tensor = p_tensor.at[:n_planets, 29].set(convergence * is_orbiting_f29)
     
     # FEATURE 30: The Endgame Horizon (True Remaining Yield)
     min_transit_ticks = 10.0 # Simplified constant
@@ -693,8 +754,12 @@ def build_observation(state: EnvState, player_id: int, win_rate: float = 0.5) ->
     local_allied_deficit = jnp.sum(close_allies_mask * deficit_allied[None, :], axis=1)
     p_tensor = p_tensor.at[:n_planets, 35].set(jnp.clip(local_allied_deficit / 100.0, 0.0, 1.0))
     
-    # Padding
-    p_tensor = p_tensor.at[:n_planets, 36].set(0.0)
+    # FEATURE 36: Allied Proximity (Distance to P1's closest border)
+    # This solves the "Targeting Closer Planets" issue by explicitly providing distance
+    my_planet_mask = (ego_planet_owner == 1.0)
+    my_dist = jnp.where(my_planet_mask, dist_mat, jnp.inf)
+    min_my_dist = jnp.min(my_dist, axis=1) # [50]
+    p_tensor = p_tensor.at[:n_planets, 36].set(1.0 / (1.0 + min_my_dist / 10.0))
     
     return p_tensor
 
@@ -739,10 +804,17 @@ def reset_env(rng):
     # Select one active group to be the home planets (0 to num_groups-1)
     home_group = jax.random.randint(r_home, (), minval=0, maxval=num_groups)
     
-    p1_idx = home_group
-    p2_idx = 30 + home_group # Q4
-    p3_idx = 10 + home_group # Q2
-    p4_idx = 20 + home_group # Q3
+    # Randomize which quadrant P1 starts in for training diversity
+    # Quadrant offsets: 0=Q1, 10=Q2, 20=Q3, 30=Q4
+    rng, r_quad = jax.random.split(rng)
+    quad_rotation = jax.random.randint(r_quad, (), minval=0, maxval=4) * 10
+    offsets = jnp.array([0, 30, 10, 20])  # P1, P2, P3, P4 base offsets
+    rotated = (offsets + quad_rotation) % 40
+    
+    p1_idx = rotated[0] + home_group
+    p2_idx = rotated[1] + home_group
+    p3_idx = rotated[2] + home_group
+    p4_idx = rotated[3] + home_group
     
     owner = jnp.zeros(40, dtype=jnp.int32)
     owner = owner.at[p1_idx].set(1)

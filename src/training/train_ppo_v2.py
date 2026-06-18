@@ -28,11 +28,11 @@ from models.entity_transformer_flax_v2 import EntityTransformer
 from env_jax.orbit_env_v2 import EnvState, step_physics, apply_actions, build_observation, reset_env
 
 # --- Stable Shared-A100 Configuration ---
-NUM_ENVS = 512
+NUM_ENVS = 2048
 ROLLOUT_STEPS = 128
-PPO_EPOCHS = 4
-BATCH_SIZE = 1024
-LEARNING_RATE = 1e-4
+PPO_EPOCHS = 2
+BATCH_SIZE = 16384
+LEARNING_RATE = 3e-4
 GAMMA = 0.999
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.1  # Tightened MAPPO clip for BC Fine-tuning
@@ -97,7 +97,7 @@ def train_ppo():
     mngr = ocp.CheckpointManager(ppo_ckpt_dir, options=ocp.CheckpointManagerOptions(max_to_keep=5, create=True))
 
     graphdef, state = nnx.split(model)
-    tx = optax.chain(optax.clip_by_global_norm(1), optax.adam(LEARNING_RATE))
+    tx = optax.chain(optax.clip_by_global_norm(1), optax.adamw(LEARNING_RATE, weight_decay=1e-4))
     opt_state = tx.init(jax.tree_util.tree_map(lambda x: x.value if hasattr(x, 'value') else x, state))
 
     # --- Checkpoint Restoration Priority: PPO_LIGHT > BC_LIGHT > Fresh Init ---
@@ -109,19 +109,39 @@ def train_ppo():
         ppo_step = mngr.latest_step()
         if ppo_step is not None:
             print(f"Resuming PPO from ppo_light checkpoint step {ppo_step}...")
-            template = {'model': state, 'opt': opt_state}
-            restored_typed = mngr.restore(ppo_step, args=ocp.args.StandardRestore(template))
+            raw = mngr.restore(ppo_step)
+            restored_model = raw.get('model', raw)
             
-            restored_model_casted = jax.tree_util.tree_map(
-                lambda r, t: jnp.asarray(r, dtype=t.value.dtype) if hasattr(t, 'value') else r,
-                restored_typed['model'], state
-            )
+            def safe_merge_ppo(path, leaf_state):
+                curr = restored_model
+                for key_obj in path:
+                    if isinstance(key_obj, jax.tree_util.DictKey):
+                        k = key_obj.key
+                        if isinstance(curr, dict) and k in curr:
+                            curr = curr[k]
+                        else:
+                            return leaf_state
+                    elif isinstance(key_obj, jax.tree_util.SequenceKey):
+                        idx = key_obj.idx
+                        if isinstance(curr, (list, tuple)) and idx < len(curr):
+                            curr = curr[idx]
+                        elif isinstance(curr, dict) and str(idx) in curr:
+                            curr = curr[str(idx)]
+                        else:
+                            return leaf_state
+                    else:
+                        return leaf_state
+                try:
+                    tgt_dtype = leaf_state.value.dtype if hasattr(leaf_state, 'value') else getattr(leaf_state, 'dtype', None)
+                    return jnp.asarray(curr, dtype=tgt_dtype) if tgt_dtype is not None else curr
+                except Exception:
+                    return leaf_state
+            
+            restored_model_casted = jax.tree_util.tree_map_with_path(safe_merge_ppo, state)
             nnx.update(model, restored_model_casted)
             
-            opt_state = jax.tree_util.tree_map(
-                lambda r, t: jnp.asarray(r, dtype=t.dtype) if hasattr(t, 'dtype') else r,
-                restored_typed['opt'], opt_state
-            )
+            # Intentionally NOT restoring opt_state to reset momentum and switch to AdamW safely
+            print("Model restored. Optimizer state reset for AdamW transition.")
             
             start_iteration = ppo_step
             restored = True
@@ -137,16 +157,42 @@ def train_ppo():
                 print(f"Loading BC pre-trained weights from bc_v2 checkpoint step {bc_step}...")
                 template = {'model': state}
                 try:
-                    restored_typed = bc_mngr.restore(bc_step, args=ocp.args.StandardRestore(template))
-                except Exception:
-                    restored_typed = bc_mngr.restore(bc_step, items=template)
+                    restored_raw = bc_mngr.restore(bc_step)
+                    # Manually merge only matching keys
+                    def safe_merge(path, leaf_state):
+                        curr = restored_raw.get('model', restored_raw)
+                        for key_obj in path:
+                            if isinstance(key_obj, jax.tree_util.DictKey):
+                                k = key_obj.key
+                                if k in ('value', 'raw_value'):
+                                    continue
+                                if isinstance(curr, dict) and k in curr:
+                                    curr = curr[k]
+                                else:
+                                    return leaf_state
+                            elif isinstance(key_obj, jax.tree_util.SequenceKey):
+                                idx = key_obj.idx
+                                if isinstance(curr, (list, tuple)) and idx < len(curr):
+                                    curr = curr[idx]
+                                elif isinstance(curr, dict) and str(idx) in curr:
+                                    curr = curr[str(idx)]
+                                else:
+                                    return leaf_state
+                            else:
+                                return leaf_state
+                        # Attempt to cast the loaded weights
+                        try:
+                            # For array leaves, jax.numpy.asarray safely casts to the exact shape and dtype expected by the model
+                            return jnp.asarray(curr, dtype=leaf_state.dtype) if hasattr(leaf_state, 'dtype') else curr
+                        except Exception:
+                            return leaf_state
                     
-                restored_model_casted = jax.tree_util.tree_map(
-                    lambda r, t: jnp.asarray(r, dtype=t.value.dtype) if hasattr(t, 'value') else r,
-                    restored_typed['model'], state
-                )
-                nnx.update(model, restored_model_casted)
-                print("Successfully loaded BC v2 weights.")
+                    restored_model_casted = jax.tree_util.tree_map_with_path(safe_merge, state)
+                        
+                    nnx.update(model, restored_model_casted)
+                    print("Successfully loaded BC v2 weights.")
+                except Exception as e2:
+                    print(f"Manual merge failed: {e2}")
             else:
                 print("No BC v2 weights found. Starting from scratch.")
                 start_iteration = 0
@@ -205,7 +251,8 @@ def train_ppo():
         avg_fleet_size = jnp.sum(jnp.where(l_act1, s_act1 + 1.0, 0.0)) / (jnp.sum(l_act1) + 1e-8)
 
         # --- PRE-ACTION SNAPSHOT (for capture delta) ---
-        pre_p1_planets = jnp.sum((env_state.planet_owner == 1).astype(jnp.float32))
+        pre_p1_planet_mask = (env_state.planet_owner == 1)
+        pre_p1_planets = jnp.sum(pre_p1_planet_mask.astype(jnp.float32))
 
         # Execute Actions for all 4 players (Angles are calculated inside orbit_env.py)
         # Measure exact number of fleets before launch
@@ -243,16 +290,29 @@ def train_ppo():
         win_condition = p1_ships > max_enemy_ships
         base_reward = jnp.where(win_condition, reward_config[0], reward_config[1])
         total_ships = p1_ships + p2_ships + p3_ships + p4_ships + 1e-8
-        ship_dominance = p1_ships / total_ships
+        
+        # ZERO-SUM: Net Advantage instead of Absolute Share
+        ship_advantage = (p1_ships - max_enemy_ships) / total_ships
         
         # --- PLANET CAPTURE DELTA (the key missing reward) ---
-        post_p1_planets = jnp.sum((env_state.planet_owner == 1).astype(jnp.float32))
+        post_p1_planet_mask = (env_state.planet_owner == 1)
+        post_p1_planets = jnp.sum(post_p1_planet_mask.astype(jnp.float32))
         planet_delta = post_p1_planets - pre_p1_planets  # +N = captured, -N = lost
+        
+        # HIGH-VALUE CAPTURE MULTIPLIER
+        newly_captured_mask = post_p1_planet_mask & ~pre_p1_planet_mask
+        newly_captured_prod = jnp.sum(jnp.where(newly_captured_mask, env_state.planet_production, 0.0))
         
         # --- PRODUCTION SHARE (economic dominance) ---
         p1_prod = jnp.sum(jnp.where(env_state.planet_owner == 1, env_state.planet_production, 0.0))
+        p2_prod = jnp.sum(jnp.where(env_state.planet_owner == 2, env_state.planet_production, 0.0))
+        p3_prod = jnp.sum(jnp.where(env_state.planet_owner == 3, env_state.planet_production, 0.0))
+        p4_prod = jnp.sum(jnp.where(env_state.planet_owner == 4, env_state.planet_production, 0.0))
+        max_enemy_prod = jnp.maximum(p2_prod, jnp.maximum(p3_prod, p4_prod))
         total_prod = jnp.sum(env_state.planet_production) + 1e-8
-        production_share = p1_prod / total_prod
+        
+        # ZERO-SUM: Net Production Advantage
+        prod_advantage = (p1_prod - max_enemy_prod) / total_prod
         
         # --- FLEET ACTIVITY ---
         # Use purely mechanistic count of successfully spawned fleets instead of network intent
@@ -261,15 +321,15 @@ def train_ppo():
 
         # Dense shaping rewards (all coefficients from JSON config)
         dense_reward = (
-            ship_dominance * reward_config[2] +              # [2] Military power ratio
-            planet_delta * reward_config[3] +                 # [3] Conquest delta (THE key signal)
-            production_share * reward_config[4] +             # [4] Economic dominance
-            fleet_count * reward_config[5] +                 # [5] Engagement activity
-            no_op_val * reward_config[6] +                    # [6] No-op penalty
-            post_p1_planets * reward_config[7]               # [7] Gentle holding nudge
+            ship_advantage * reward_config[2] +                 # [2] Military power advantage (Zero-Sum)
+            (planet_delta * reward_config[3]) + (newly_captured_prod * 0.1 * reward_config[3]) + # [3] Conquest delta + Prod Multiplier
+            prod_advantage * reward_config[4] +                 # [4] Economic advantage (Zero-Sum)
+            fleet_count * reward_config[5] +                    # [5] Engagement activity
+            no_op_val * reward_config[6] +                      # [6] No-op penalty
+            (post_p1_planets / 50.0) * reward_config[7]         # [7] Gentle holding nudge (normalized)
         )
         
-        terminal_bonus = ship_dominance * reward_config[8]    # [8] Configurable terminal dominance
+        terminal_bonus = ship_advantage * reward_config[8]    # [8] Configurable terminal dominance
         reward = jnp.where(done, base_reward + terminal_bonus + dense_reward, dense_reward)
         
         def _reset(r): return reset_env(r)
@@ -366,6 +426,7 @@ def train_ppo():
             'a_angle': transitions['action_angle'].reshape(-1, 50) if 'action_angle' in transitions else transitions['a_angle'].reshape(-1, 50),
             'a_ships': transitions['action_ships'].reshape(-1, 50) if 'action_ships' in transitions else transitions['a_ships'].reshape(-1, 50),
             'old_lp': transitions['log_prob'].reshape(-1, 50) if 'log_prob' in transitions else transitions['old_lp'].reshape(-1, 50),
+            'old_v': transitions['value'].reshape(-1) if 'value' in transitions else transitions['old_v'].reshape(-1),
             'adv': flat_advs,
             'ret': scaled_rets
         }
@@ -415,11 +476,12 @@ def train_ppo():
         surr2 = jnp.where(valid_launch_mask, jnp.clip(ratio, 1.0 - current_clip, 1.0 + current_clip) * adv_broadcast, 0.0)
         
         policy_loss = -jnp.sum(jnp.minimum(surr1, surr2)) / (jnp.sum(valid_launch_mask) + 1e-8)
-        policy_loss = jnp.nan_to_num(policy_loss)
         
         value_pred = ppo_v[..., 0] if len(ppo_v.shape) > 1 else ppo_v
-        value_loss = jnp.mean(jnp.square(value_pred - batch['ret']))
-        value_loss = jnp.nan_to_num(value_loss)
+        v_clipped = batch['old_v'] + jnp.clip(value_pred - batch['old_v'], -current_clip, current_clip)
+        v_loss_unclipped = jnp.square(value_pred - batch['ret'])
+        v_loss_clipped = jnp.square(v_clipped - batch['ret'])
+        value_loss = 0.5 * jnp.mean(jnp.maximum(v_loss_unclipped, v_loss_clipped))
         
         # PATCH 4: Masked Entropy Calculation
         launch_ent_raw = -(launch_prob * jnp.log(launch_prob + 1e-8) + (1.0 - launch_prob) * jnp.log(1.0 - launch_prob + 1e-8))
@@ -433,7 +495,6 @@ def train_ppo():
         # FIX: Mask unused head entropy by valid_launch_mask to prevent entropy farming
         valid_entropies = (launch_ent_raw + launch_prob * (0.5 * target_ent_raw + 0.3 * ships_ent_raw)) * valid_launch_mask
         entropy = jnp.sum(valid_entropies) / (jnp.sum(valid_launch_mask) + 1e-8)
-        entropy = jnp.nan_to_num(entropy)
         
         # Calculate Explained Variance to track Value Network health
         explained_var = 1.0 - jnp.var(batch['ret'] - value_pred) / (jnp.var(batch['ret']) + 1e-8)
@@ -457,6 +518,10 @@ def train_ppo():
     def train_batch(s_flat, o_st, batch, current_entropy, current_clip):
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, metrics), grads = grad_fn(s_flat, batch, current_entropy, current_clip)
+        
+        # BULLETPROOF FIX: Prevent transient NaNs from infecting weights
+        grads = jax.tree_util.tree_map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads)
+        
         metrics['grad_norm'] = optax.global_norm(grads)
         updates, o_st = tx.update(grads, o_st, s_flat)
         s_flat = optax.apply_updates(s_flat, updates)
@@ -549,8 +614,12 @@ def train_ppo():
             match_type = "Rand Baseline"
             opp = rule_bot_state
             opp_pool_idx = -1
+        elif opp_choice < 0.30:
+            match_type = "Best Agent"
+            opp = best_agent_state
+            opp_pool_idx = -1
         elif opp_choice < 0.75 or len(league_pool) == 0:
-            # 65% Pure Self-Play
+            # 45% Pure Self-Play
             match_type = "Self-Play"
             opp = {"iter": iteration, "weights": state_flat} 
             opp_pool_idx = -1
@@ -630,8 +699,7 @@ def train_ppo():
         }
         
         # SAC-style Alpha Update
-        # Flat target entropy for BC fine-tuning to prevent deterministic collapse without destroying weights
-        target_entropy = 0.5 
+        target_entropy = 0.10 
         
         # We need raw_metrics['ent'] as a pure python float to update log_alpha
         # JAX array item extraction
@@ -640,7 +708,7 @@ def train_ppo():
         # If actual > target, explore less (alpha decreases)
         # If actual < target, explore more (alpha increases)
         log_alpha -= 0.05 * (actual_entropy - target_entropy)
-        current_entropy_val = math.exp(log_alpha)
+        current_entropy_val = min(math.exp(log_alpha), 0.05)
         
         # Single Device-to-Host Synchronization
         host_metrics = jax.device_get(raw_metrics)

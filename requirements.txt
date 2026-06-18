@@ -1,0 +1,6 @@
+kaggle-environments==1.14.17
+numpy
+scipy
+cma
+tqdm
+numba

@@ -1,0 +1,5 @@
+WARNING:absl:Item "default" was found in the checkpoint, but could not be restored. Please provide a `CheckpointHandlerRegistry`, or call `restore` with an appropriate `CheckpointArgs` subclass.
+WARNING:absl:Item "default" was found in the checkpoint, but could not be restored. Please provide a `CheckpointHandlerRegistry`, or call `restore` with an appropriate `CheckpointArgs` subclass.
+Loading step 3600
+Overall Max Abs Weight: 1.11
+Model is clean of NaNs and Infs.

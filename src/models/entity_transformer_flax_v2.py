@@ -111,9 +111,9 @@ class EntityTransformer(nnx.Module):
         planet_out = out[:, 1:1+self.num_planets, :] 
         
         # 1. Autoregressive Launch
-        launch_logits = jnp.squeeze(self.actor_launch(planet_out), axis=-1)
+        launch_logits = jnp.squeeze(self.actor_launch(planet_out), axis=-1).astype(jnp.float32)
         if valid_launch_mask is not None:
-            launch_logits = jnp.where(valid_launch_mask, launch_logits, -1e9)
+            launch_logits = jnp.where(valid_launch_mask, launch_logits, -1e4)
         
         if target_launch is not None:
             launch_choices = jnp.minimum(jnp.maximum(target_launch, 0), 1).astype(jnp.int32)
@@ -128,7 +128,7 @@ class EntityTransformer(nnx.Module):
 
         # 2. Autoregressive Ships (NEW CAUSALITY ORDER)
         ships_input = jnp.concatenate([planet_out, launch_emb], axis=-1)
-        ships_logits = self.actor_ships(ships_input)
+        ships_logits = self.actor_ships(ships_input).astype(jnp.float32)
         
         if target_ships is not None:
             ships_choices = jnp.minimum(jnp.maximum(target_ships, 0), 9).astype(jnp.int32)
@@ -155,7 +155,7 @@ class EntityTransformer(nnx.Module):
         all_masked = jnp.all(mask, axis=-1, keepdims=True)
         mask = jnp.where(all_masked, False, mask)
         
-        angle_logits = jnp.where(mask, -1e9, angle_logits)
+        angle_logits = jnp.where(mask, -1e4, angle_logits).astype(jnp.float32)
 
         if target_angle is not None:
             target_choices = jnp.minimum(jnp.maximum(target_angle, 0), self.num_planets-1).astype(jnp.int32)
@@ -165,7 +165,7 @@ class EntityTransformer(nnx.Module):
         else:
             target_choices = jnp.argmax(angle_logits, axis=-1).astype(jnp.int32)
 
-        ppo_value = jnp.squeeze(self.ppo_value_head(cls_out), axis=-1)
+        ppo_value = jnp.squeeze(self.ppo_value_head(cls_out), axis=-1).astype(jnp.float32)
 
         if sample_rng is not None:
             return v_logits, launch_logits, ships_logits, angle_logits, ppo_value, launch_choices, ships_choices, target_choices

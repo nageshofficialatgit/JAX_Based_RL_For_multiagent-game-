@@ -1,0 +1,10 @@
+total 188568
+-rw-rw-r--  1 medhasree_2121cs05 medhasree_2121cs05        0 Jun 17 12:19 last_files.txt
+-rw-rw-r--  1 medhasree_2121cs05 medhasree_2121cs05   397532 Jun 17 12:19 ppo_training.log
+drwxrwxr-x 51 medhasree_2121cs05 medhasree_2121cs05     4096 Jun 17 11:30 runs
+drwxrwxr-x  3 medhasree_2121cs05 medhasree_2121cs05     4096 Jun 17 11:20 3050
+-rw-rw-r--  1 medhasree_2121cs05 medhasree_2121cs05    98489 Jun 17 11:11 agent_brain.log
+-rw-rw-r--  1 medhasree_2121cs05 medhasree_2121cs05 11523719 Jun 17 11:05 ppo_v2_3050_vs_braniac_replay.html
+drwxrwxr-x  8 medhasree_2121cs05 medhasree_2121cs05     4096 Jun 17 11:01 checkpoints
+-rw-r--r--  1 medhasree_2121cs05 medhasree_2121cs05    22186 Jun 17 11:01 agent_bc.py
+-rw-rw-r--  1 medhasree_2121cs05 medhasree_2121cs05      927 Jun 17 11:01 export_ckpt.py

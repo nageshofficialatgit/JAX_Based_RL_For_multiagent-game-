@@ -1,0 +1,22 @@
+{
+  "dist_exponent": 1.3735148993010464,
+  "dist_penalty": -4.249765720693228,
+  "enemy_leader_ships": -0.022366932120773786,
+  "enemy_prod_total": -4.708711539001384,
+  "enemy_ships_total": -0.19173220491544551,
+  "enemy_spread_bonus": 1.4329461380751813,
+  "enemy_spread_exponent": 0.8435747062455857,
+  "friendly_defense_bonus": 1.6367010953600245,
+  "my_planets": 7.585570503661855,
+  "my_production_base": 8.223185335100393,
+  "my_production_decay": -0.003846976537974778,
+  "my_spread_exponent": 1.2863634416072425,
+  "my_spread_penalty": -4.88601285845491,
+  "retreat_threshold": 1.3522648625282574,
+  "target_enemy_prod_bonus": 13.23275839916228,
+  "target_neutral_cost_penalty": -0.5171766523592858,
+  "weight_t100": 0.715544141421843,
+  "weight_t30": 0.1954558424816275,
+  "weight_t60": 0.9966174399508333,
+  "_avg_rank": 1.5
+}

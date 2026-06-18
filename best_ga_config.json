@@ -1,0 +1,63 @@
+{
+    "horizon": [
+        5.0,
+        5.0,
+        40.0
+    ],
+    "max_waves_per_turn": 6,
+    "roi_threshold": [
+        5.0,
+        20.0,
+        10.0
+    ],
+    "min_ships_to_launch": [
+        10.0,
+        10.0,
+        10.0
+    ],
+    "reinforce_size_beta": [
+        20.0,
+        35.0,
+        25.0
+    ],
+    "reinforce_eta_free": [
+        30.0,
+        25.0,
+        30.0
+    ],
+    "reinforce_eta_scale": [
+        25.0,
+        55.0,
+        5.0
+    ],
+    "production_value_multiplier": [
+        20.0,
+        25.0,
+        30.0
+    ],
+    "attrition_penalty": [
+        0.0,
+        20.0,
+        0.0
+    ],
+    "harassment_reward_weight": [
+        35.0,
+        0.0,
+        20.0
+    ],
+    "defend_production_bias": [
+        30.0,
+        30.0,
+        25.0
+    ],
+    "regroup_weight": [
+        0.0,
+        15.0,
+        15.0
+    ],
+    "panic_threshold": [
+        25.0,
+        5.0,
+        5.0
+    ]
+}

@@ -171,7 +171,7 @@ def train_bc():
         print(f"  -> Connected to disk. Shape: {full_dataset_np['state_tokens'].shape}")
     else:
         print(f"Streaming {dataset_path} directly to Hard Disk (Zero RAM Spike)...")
-        workers = 8  # 8 workers are fully supported now via mmap and local disk caching
+        workers = 0  # 8 workers are fully supported now via mmap and local disk caching
         dl = build_grain_dataloader(
             db_path=dataset_path,
             batch_size=BATCH_SIZE,

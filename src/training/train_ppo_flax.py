@@ -83,10 +83,17 @@ def reset_env(rng):
     # Select one active group to be the home planets (0 to num_groups-1)
     home_group = jax.random.randint(r_home, (), minval=0, maxval=num_groups)
     
-    p1_idx = home_group
-    p2_idx = 30 + home_group # Q4
-    p3_idx = 10 + home_group # Q2
-    p4_idx = 20 + home_group # Q3
+    # Randomize which quadrant P1 starts in for training diversity
+    # Quadrant offsets: 0=Q1, 10=Q2, 20=Q3, 30=Q4
+    rng, r_quad = jax.random.split(rng)
+    quad_rotation = jax.random.randint(r_quad, (), minval=0, maxval=4) * 10
+    offsets = jnp.array([0, 30, 10, 20])  # P1, P2, P3, P4 base offsets
+    rotated = (offsets + quad_rotation) % 40
+    
+    p1_idx = rotated[0] + home_group
+    p2_idx = rotated[1] + home_group
+    p3_idx = rotated[2] + home_group
+    p4_idx = rotated[3] + home_group
     
     owner = jnp.zeros(40, dtype=jnp.int32)
     owner = owner.at[p1_idx].set(1)
